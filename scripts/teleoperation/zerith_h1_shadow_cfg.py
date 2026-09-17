@@ -29,10 +29,36 @@ class ShadowTopics:
     xr_pose: str = "/xr_pose"
 
 DEFAULT_TOPICS = ShadowTopics()
+SIM_TOPICS = ShadowTopics(
+    final_left_arm="/sim/control/mux/in/xr/left_arm/motors_cmd",
+    final_right_arm="/sim/control/mux/in/xr/right_arm/motors_cmd",
+    joint_states="/sim/h1/joint_states",
+    mux_input_left_arm="/sim/control/mux/in/xr/left_arm/motors_cmd",
+    mux_input_right_arm="/sim/control/mux/in/xr/right_arm/motors_cmd",
+    xr_pose="/sim/xr_pose",
+)
 
 class JointStateLike(Protocol):
     name: list[str]
     position: list[float]
+
+
+def validate_standalone_topics(topics: ShadowTopics) -> None:
+    """Reject standalone topic maps that could publish onto a real robot graph."""
+    for topic in (topics.final_left_arm, topics.final_right_arm, topics.joint_states):
+        if not topic.startswith("/sim/"):
+            raise ValueError(f"Standalone topics must use the /sim namespace: {topic}")
+
+
+def encode_sim_joint_state(arm_positions: np.ndarray) -> np.ndarray:
+    """Encode arm positions in pico-teleop's 21-element JointState layout."""
+    values = np.asarray(arm_positions, dtype=np.float64)
+    if values.shape != (len(ARM_JOINTS),) or not np.all(np.isfinite(values)):
+        raise ValueError("Expected 14 finite Zerith arm joint positions.")
+    state = np.zeros(21, dtype=np.float64)
+    state[5:12] = values[:7]
+    state[14:21] = values[7:]
+    return state
 
 def decode_arm_command(message: JointStateLike, joint_names: tuple[str, ...], side: str) -> tuple[np.ndarray | None, str]:
     """Return seven values by canonical name, or Pico's documented positional layout."""

@@ -2,10 +2,10 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
-"""Read-only Isaac Lab shadow of final Zerith H1 dual-arm mux commands.
+"""Isaac Lab shadow and isolated standalone teleoperation for Zerith H1.
 
 Launch with ``./isaaclab.bat -p scripts/teleoperation/zerith_h1_shadow.py``.
-No ROS publisher is created by this program.
+Shadow mode creates no ROS publisher. Standalone mode publishes only /sim/h1/joint_states.
 """
 from __future__ import annotations
 import argparse
@@ -18,7 +18,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 from isaaclab.app import AppLauncher
-from zerith_h1_shadow_cfg import (ARM_JOINTS, DEFAULT_COMMAND_TIMEOUT_S, DEFAULT_LOG_DIR, DEFAULT_PHYSICS_DT_S, DEFAULT_TOPICS, ShadowTopics, ZERITH_H1_USD_PATH, decode_arm_command, decode_real_joint_state)
+from zerith_h1_shadow_cfg import (ARM_JOINTS, DEFAULT_COMMAND_TIMEOUT_S, DEFAULT_LOG_DIR, DEFAULT_PHYSICS_DT_S, DEFAULT_TOPICS, SIM_TOPICS, ShadowTopics, ZERITH_H1_USD_PATH, decode_arm_command, decode_real_joint_state, encode_sim_joint_state, validate_standalone_topics)
 
 parser = argparse.ArgumentParser(description="Read-only Zerith H1 Isaac Lab shadow runner.")
 parser.add_argument("--log_dir", type=Path, default=DEFAULT_LOG_DIR)
@@ -27,6 +27,7 @@ parser.add_argument("--physics_dt", type=float, default=DEFAULT_PHYSICS_DT_S)
 parser.add_argument("--record_mux_inputs", action="store_true")
 parser.add_argument("--record_xr", action="store_true")
 parser.add_argument("--max_steps", type=int, default=0)
+parser.add_argument("--mode", choices=("shadow", "standalone"), default="shadow")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 app_launcher = AppLauncher(args_cli)
@@ -50,11 +51,13 @@ def stamp_ns(message: Any) -> int | None:
     return None if stamp is None else int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
 class ShadowRosSubscriber:
-    """ROS subscriptions only; this class deliberately has no publish API."""
-    def __init__(self, topics: ShadowTopics, record_mux_inputs: bool, record_xr: bool):
+    """ROS bridge whose only publishing capability is isolated standalone feedback."""
+    def __init__(self, topics: ShadowTopics, record_mux_inputs: bool, record_xr: bool, mode: str):
         import rclpy
         from sensor_msgs.msg import JointState
-        self._rclpy, self._owns_context = rclpy, not rclpy.ok()
+        self._rclpy, self._owns_context, self.mode = rclpy, not rclpy.ok(), mode
+        if mode == "standalone":
+            validate_standalone_topics(topics)
         if self._owns_context:
             rclpy.init()
         self.node = rclpy.create_node("zerith_h1_isaaclab_shadow")
@@ -67,8 +70,12 @@ class ShadowRosSubscriber:
         self.subscriptions = [
             self.node.create_subscription(JointState, topics.final_left_arm, self._on_final_left, 20),
             self.node.create_subscription(JointState, topics.final_right_arm, self._on_final_right, 20),
-            self.node.create_subscription(JointState, topics.joint_states, self._on_real, 50),
         ]
+        self.joint_state_publisher = None
+        if mode == "shadow":
+            self.subscriptions.append(self.node.create_subscription(JointState, topics.joint_states, self._on_real, 50))
+        else:
+            self.joint_state_publisher = self.node.create_publisher(JointState, topics.joint_states, 50)
         if record_mux_inputs:
             self.subscriptions += [
                 self.node.create_subscription(JointState, topics.mux_input_left_arm, self._on_mux_left, 20),
@@ -100,6 +107,16 @@ class ShadowRosSubscriber:
         with self.lock: self.xr_receipts.append((time.monotonic(), getattr(message, "timestamp_ns", None)))
     def spin_once(self) -> None:
         self.executor.spin_once(timeout_sec=0.0)
+    def publish_sim_joint_state(self, arm_positions: np.ndarray) -> None:
+        """Publish simulated feedback only when standalone namespace validation passed."""
+        if self.joint_state_publisher is None:
+            return
+        from sensor_msgs.msg import JointState
+        message = JointState()
+        message.header.stamp = self.node.get_clock().now().to_msg()
+        message.name = [f"sim_joint_{index}" for index in range(21)]
+        message.position = encode_sim_joint_state(arm_positions).tolist()
+        self.joint_state_publisher.publish(message)
     def snapshot(self) -> tuple[TimedVector, TimedVector, TimedVector, TimedVector, TimedVector]:
         with self.lock:
             return tuple(TimedVector(**item.__dict__) for item in (self.final_left, self.final_right, self.real, self.mux_left, self.mux_right))
@@ -156,7 +173,9 @@ def main() -> None:
     ids, names = robot.find_joints(list(ARM_JOINTS), preserve_order=True)
     if tuple(names) != ARM_JOINTS: raise RuntimeError(f"USD joint mapping mismatch: {names}")
     ids = torch.tensor(ids, dtype=torch.long, device=sim.device)
-    ros, logger = ShadowRosSubscriber(DEFAULT_TOPICS, args_cli.record_mux_inputs, args_cli.record_xr), ShadowLogger(args_cli.log_dir)
+    topics = DEFAULT_TOPICS if args_cli.mode == "shadow" else SIM_TOPICS
+    ros = ShadowRosSubscriber(topics, args_cli.record_mux_inputs, args_cli.record_xr, args_cli.mode)
+    logger = ShadowLogger(args_cli.log_dir)
     aligned = False; timeout_count = 0; step = 0
     try:
         while simulation_app.is_running() and (args_cli.max_steps == 0 or step < args_cli.max_steps):
@@ -165,8 +184,9 @@ def main() -> None:
             target = np.concatenate((left.value, right.value)) if fresh else None
             mux_input = np.concatenate((mux_left.value, mux_right.value)) if mux_left.value is not None and mux_right.value is not None else None
             if target is None: timeout_count += 1
-            if not aligned and feedback.value is not None:
-                q = torch.as_tensor(feedback.value, dtype=torch.float32, device=sim.device).unsqueeze(0)
+            initial_state = feedback.value if args_cli.mode == "shadow" else target
+            if not aligned and initial_state is not None:
+                q = torch.as_tensor(initial_state, dtype=torch.float32, device=sim.device).unsqueeze(0)
                 robot.write_joint_position_to_sim_index(position=q, joint_ids=ids); robot.write_joint_velocity_to_sim_index(velocity=torch.zeros_like(q), joint_ids=ids); robot.reset(); aligned = True
             if aligned:
                 hold_or_target = target
@@ -174,7 +194,10 @@ def main() -> None:
                     hold_or_target = robot.data.joint_pos.torch[0, ids].detach().cpu().numpy()
                 robot.set_joint_position_target_index(target=torch.as_tensor(hold_or_target, dtype=torch.float32, device=sim.device).unsqueeze(0), joint_ids=ids)
             robot.write_data_to_sim(); sim.step(); robot.update(args_cli.physics_dt)
-            logger.write(now, mux_input, target, feedback.value, robot.data.joint_pos.torch[0, ids].detach().cpu().numpy(), left, feedback, aligned, timeout_count, ros.xr_receipt_count()); step += 1
+            sim_arm_positions = robot.data.joint_pos.torch[0, ids].detach().cpu().numpy()
+            if args_cli.mode == "standalone":
+                ros.publish_sim_joint_state(sim_arm_positions)
+            logger.write(now, mux_input, target, feedback.value, sim_arm_positions, left, feedback, aligned, timeout_count, ros.xr_receipt_count()); step += 1
     finally:
         logger.close(); ros.close()
 
