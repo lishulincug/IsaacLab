@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Protocol
 import numpy as np
 
-ZERITH_H1_USD_PATH = Path(r"D:\robot\sim\zerith_H1\robot_fix.usda")
+ZERITH_H1_USD_PATH = Path(r"/home/mengfei/genie_sim/source/geniesim_assets/robot/zerith_H1/robot_fix.usda")
 LEFT_ARM_JOINTS = ("left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_yaw_joint", "left_wrist_pitch_joint")
 RIGHT_ARM_JOINTS = ("right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_yaw_joint", "right_wrist_pitch_joint")
 ARM_JOINTS = LEFT_ARM_JOINTS + RIGHT_ARM_JOINTS

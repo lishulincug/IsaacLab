@@ -36,8 +36,10 @@ simulation_app = app_launcher.app
 import numpy as np
 import torch
 import isaaclab.sim as sim_utils
+from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.sim import SimulationContext
+from isaaclab.sim.schemas import ArticulationRootBaseCfg
 
 @dataclass
 class TimedVector:
@@ -162,8 +164,23 @@ class ShadowLogger:
         (self.dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 def robot_cfg() -> ArticulationCfg:
-    if not ZERITH_H1_USD_PATH.exists(): raise FileNotFoundError(ZERITH_H1_USD_PATH)
-    return ArticulationCfg(prim_path="/World/ZerithH1", spawn=sim_utils.UsdFileCfg(usd_path=str(ZERITH_H1_USD_PATH), variants={"Physics":"PhysX", "Robot":"Robot", "Sensor":"None"}, articulation_props=sim_utils.ArticulationRootBaseCfg(fix_root_link=True)))
+    if not ZERITH_H1_USD_PATH.exists():
+        raise FileNotFoundError(ZERITH_H1_USD_PATH)
+    return ArticulationCfg(
+        prim_path="/World/ZerithH1",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=str(ZERITH_H1_USD_PATH),
+            variants={"Physics": "PhysX", "Robot": "Robot", "Sensor": "None"},
+            articulation_props=ArticulationRootBaseCfg(fix_root_link=True),
+        ),
+        actuators={
+            "arms": ImplicitActuatorCfg(
+                joint_names_expr=list(ARM_JOINTS),
+                stiffness=None,
+                damping=None,
+            )
+        },
+    )
 
 def main() -> None:
     if args_cli.command_timeout_s <= 0 or args_cli.physics_dt <= 0: raise ValueError("Timeout and physics dt must be positive.")
